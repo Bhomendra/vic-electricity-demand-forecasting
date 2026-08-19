@@ -151,8 +151,14 @@ def peak_mae(y_true, y_pred, index):
 
 
 def cost_proxy(y_true, y_pred, rrp):
-    """Rough $/interval imbalance cost: |error| MW * 0.5 h * spot price $/MWh."""
-    return float(np.mean(np.abs(y_true - y_pred) * 0.5 * rrp))
+    """Rough $/interval imbalance cost: |error| MW * 0.5 h * |spot price| $/MWh.
+
+    The absolute value on RRP matters: ~34% of VIC1 intervals settle at a
+    NEGATIVE price (rooftop solar). A retailer is exposed to the magnitude of
+    the imbalance either way, so a signed price would let negative-price
+    intervals cancel out real exposure and understate the cost.
+    """
+    return float(np.mean(np.abs(y_true - y_pred) * 0.5 * np.abs(rrp)))
 
 
 # ----------------------------------------------------------------------------
@@ -163,10 +169,16 @@ def run_models(X, target, tag, rrp=None):
     print(f"\n=== {tag}: train {len(Xtr):,} / test {len(Xte):,} intervals ===")
     rows, preds = [], {}
 
-    # Baseline: seasonal naive (same time yesterday)
+    # Baseline 1: persistence (30 min ago). The honest bar for a one-step-ahead
+    # forecast, because the models are given lag_1 as a feature.
+    persist = Xte["lag_1"].values
+    rows.append(evaluate(yte.values, persist, f"{tag} | Persistence (t-1)"))
+    preds["Persistence (t-1)"] = persist
+
+    # Baseline 2: seasonal naive (same time yesterday)
     naive = Xte["lag_48"].values
     rows.append(evaluate(yte.values, naive, f"{tag} | Seasonal naive (t-48)"))
-    preds["Seasonal naive"] = naive
+    preds["Seasonal naive (t-48)"] = naive
 
     # M1 Gradient boosting
     gbm = HistGradientBoostingRegressor(
@@ -194,9 +206,13 @@ def run_models(X, target, tag, rrp=None):
     # Operational metrics only meaningful for the grid-level series
     if rrp is not None:
         rrp_te = rrp.reindex(Xte.index).ffill().values
+        # Match on the exact label, not endswith(): "Grid VIC | Seasonal naive
+        # (t-48)" does NOT end with "Seasonal naive", so the old code silently
+        # left the baselines with no peak / dollar figure at all.
         for name, p in preds.items():
+            label = f"{tag} | {name}"
             for r in rows:
-                if r["model"].endswith(name):
+                if r["model"] == label:
                     r["peak_MAE"] = peak_mae(yte.values, p, Xte.index)
                     r["imbalance_$_per_interval"] = cost_proxy(yte.values, p, rrp_te)
 
